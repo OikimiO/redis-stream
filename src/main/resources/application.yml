@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: stream
+
+  redis:
+    host: localhost
+    port: 6379
+
+
+logging:
+  level:
+    org.springframework.data.redis: DEBUG
+    io.lettuce.core: DEBUG
+
+
