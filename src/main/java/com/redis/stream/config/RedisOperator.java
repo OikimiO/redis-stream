@@ -1,5 +1,6 @@
 package com.redis.stream.config;
 
+import com.redis.stream.dto.User;
 import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.codec.StringCodec;
 import io.lettuce.core.output.StatusOutput;
@@ -9,15 +10,16 @@ import io.lettuce.core.protocol.CommandType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Range;
-import org.springframework.data.redis.connection.stream.MapRecord;
-import org.springframework.data.redis.connection.stream.ReadOffset;
-import org.springframework.data.redis.connection.stream.StreamInfo;
+import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.data.redis.core.convert.MappingRedisConverter;
+import org.springframework.data.redis.core.mapping.RedisMappingContext;
+import org.springframework.data.redis.hash.ObjectHashMapper;
 import org.springframework.data.redis.stream.StreamMessageListenerContainer;
 import org.springframework.stereotype.Component;
-
+import com.google.common.util.concurrent.RateLimiter;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -26,9 +28,25 @@ import java.util.Map;
 @Component
 @RequiredArgsConstructor
 public class RedisOperator {
-    private final RedisTemplate<String, String> redisTemplate;
+    private static final long MAX_NUMBER_FETCH = 300;
+
+    private final RateLimiter rateLimiter = RateLimiter.create(200);  // 초당 200개 메시지 생성
+
+    private final RedisTemplate<String, User> redisTemplate;
+
+    public void objectPublish(String streamKey){
+        rateLimiter.acquire();  // 메시지를 보내기 전에 RateLimiter로부터 대기
+
+        ObjectRecord<String, User> record = StreamRecords.newRecord()
+                .in(streamKey)
+                .ofObject(new User("night", "angel"));
+
+        redisTemplate.opsForStream().add(record);
+    }
 
     public void publish(String streamKey, Map<Object, Object> messageContent){
+        rateLimiter.acquire();  // 메시지를 보내기 전에 RateLimiter로부터 대기
+
         // MapRecord 생성
         MapRecord<String, Object, Object> record = MapRecord.create(streamKey, messageContent);
 
@@ -38,25 +56,52 @@ public class RedisOperator {
 
     // RedisOperator :: 기본 StreamMessageListenerContainer 생성
     public StreamMessageListenerContainer createStreamMessageListenerContainer(){
+        RedisMappingContext ctx = new RedisMappingContext();
+        ctx.setInitialEntitySet(Collections.singleton(User.class));
+        ObjectHashMapper objectHashMapper = new ObjectHashMapper(new MappingRedisConverter(ctx));
+
         return StreamMessageListenerContainer.create(
                 this.redisTemplate.getConnectionFactory(),
                 StreamMessageListenerContainer
                         .StreamMessageListenerContainerOptions.builder()
-                        .hashKeySerializer(new StringRedisSerializer())
-                        .hashValueSerializer(new StringRedisSerializer())
-                        .pollTimeout(Duration.ofMillis(20))
+                        //.hashKeySerializer(new StringRedisSerializer())
+                        //.hashValueSerializer(new StringRedisSerializer())
+                        .objectMapper(objectHashMapper)
+                        .pollTimeout(Duration.ofSeconds(2))
                         .build()
         );
     }
 
     /** XACK **/
-    public void ackStream(String consumerGroupName, MapRecord<String, Object, Object> message){
-        log.info("ACK 진행중 ... ");
+    public void ackStream(String streamKey, ObjectRecord<String, User> message){
+        log.info("XACK 진행중 ... ");
 
-        this.redisTemplate.opsForStream().acknowledge(consumerGroupName, message);
+        this.redisTemplate.opsForStream().acknowledge(streamKey, message);
     }
 
-    /** RANGE 조회 **/
+    /** XDEL **/
+    public void deleteStream(String streamKey, ObjectRecord<String, User> message) {
+        log.info("XDEL 진행중 ... ");
+
+        this.redisTemplate.opsForStream().delete(streamKey, message.getId());
+    }
+
+    /** XCLAIM **/
+    public void claimStream(PendingMessage pendingMessage, String consumerName){
+        RedisAsyncCommands commands = (RedisAsyncCommands) this.redisTemplate
+                .getConnectionFactory().getConnection().getNativeConnection();
+
+        CommandArgs<String, String> args = new CommandArgs<>(StringCodec.UTF8)
+                .add(pendingMessage.getIdAsString())
+                .add(pendingMessage.getGroupName())
+                .add(consumerName)
+                .add("20")
+                .add(pendingMessage.getIdAsString());
+
+        commands.dispatch(CommandType.XCLAIM, new StatusOutput(StringCodec.UTF8), args);
+    }
+
+    /** XRANGE 조회 **/
     // Range 조회를 활용한 message 단 건 조회
     public MapRecord<String, Object, Object> findStreamMessageById(String streamKey, String id){
         List<MapRecord<String, Object, Object>> mapRecordList = this.findStreamMessageByRange(streamKey, id, id);
@@ -106,5 +151,18 @@ public class RedisOperator {
             }
         }
         return false;
+    }
+
+    public PendingMessages findStreamPendingMessages(String streamKey, String consumerGroupName) {
+        return redisTemplate.opsForStream().pending(streamKey,
+                consumerGroupName, Range.unbounded(), MAX_NUMBER_FETCH);
+    }
+
+    public Object getRedisValue(String errorCount, String idAsString) {
+        return 0;
+    }
+
+    public void increaseRedisValue(String errorCount, String idAsString) {
+
     }
 }
